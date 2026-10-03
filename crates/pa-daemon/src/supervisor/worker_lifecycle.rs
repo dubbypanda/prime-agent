@@ -8,11 +8,12 @@ use super::launch_budget::{
 };
 #[cfg(not(unix))]
 use super::launch_budget::{WORKER_PROBE_BACKOFF_MAX_MS, WORKER_PROBE_BACKOFF_MIN_MS};
+use super::routing::WORKER_REQUEST_TIMEOUT_MS;
 use super::{
     anyhow, create_command_payload, json, persist_worker, socket, util, Arc, Context,
     DaemonCommand, DaemonWorkerDescriptor, DaemonWorkerLifecycle, DurableDaemonCreateCommand,
     Duration, EngineModelSelection, Map, Ordering, Path, ResidentWorker, Result, RouteAdmission,
-    Supervisor, TypedCreateRejection, Value, LONG_ROUTE_TIMEOUT_MS, ROUTE_TIMEOUT_MS,
+    Supervisor, TempSync, TypedCreateRejection, Value, ROUTE_TIMEOUT_MS,
 };
 use crate::lease::is_process_alive;
 use crate::protocol::{response_failure, response_success, DaemonResponse};
@@ -119,11 +120,23 @@ impl Supervisor {
             config,
             telemetry_disabled,
             runtime_metadata,
+            env,
             ..
         } = create
         else {
             return Err(anyhow!("launch_worker requires a create command"));
         };
+        // The allowlisted client env (the pane identity, e.g. Herdr's
+        // `HERDR_*`) re-filtered here (the socket peer is untrusted) and
+        // carried on the durable create command: the worker resolves its
+        // session's pane identity from the create payload — never from
+        // this supervisor process's boot environment (the TS daemon
+        // boot-context bug class, not reproduced) — and a respawned
+        // worker re-receives the same identity.
+        let client_env = env
+            .as_ref()
+            .map(crate::herdr::filter_client_env)
+            .filter(|env| !env.is_empty());
         // The shutdown gate: a create dispatched while the supervisor is
         // stopping must never launch a worker the stop pass would miss (a
         // late create racing a shutdown would otherwise orphan its worker
@@ -239,17 +252,29 @@ impl Supervisor {
             "rlmMaxDepth",
             "parentSessionPath",
             "models",
+            // The scripted-parent verification seam: a dropped key leaves
+            // spawned children scriptless.
+            "childScript",
+            // The semantic-edge spawn anchor rides the durable create so a
+            // respawned child keeps its provenance (its ledger
+            // re-registers idempotently either way).
+            "spawnedByRequestId",
             "systemPrompt",
             "appendSystemPrompt",
             "skills",
             "promptTemplates",
-            "extensions",
-            "tools",
             "autonomous",
+            "executionMode",
         ] {
             if let Some(value) = config_object.and_then(|config| config.get(key)) {
                 durable_rest.insert(key.to_string(), value.clone());
             }
+        }
+        // The session's pane identity (the allowlisted client env) rides
+        // the durable create command so the worker's `create` payload
+        // carries it and a respawn replays it.
+        if let Some(client_env) = client_env {
+            durable_rest.insert("env".to_string(), serde_json::to_value(client_env)?);
         }
         // A child's RLM identity rides the durable create command too, so a
         // respawned or adopted child stays identifiable for ledger appends.
@@ -310,11 +335,16 @@ impl Supervisor {
         // self-registers on boot, and the registration handler must find its
         // identity in the registry (registration races the create replay).
         self.registry.insert(Arc::clone(&resident)).await;
-        let deadline = worker_connect_deadline();
+        let deadline = self.connect_deadline();
         // A failed launch never leaves its half-registered resident behind:
         // a later stale-id rebind (or resolve) must not select a worker
-        // that cannot route.
-        let child = match self.spawn_worker_process(&resident, deadline).await {
+        // that cannot route. The spawn record rides the unsynced TS
+        // `persistWorker` shape on this fresh create (the relaunch paths
+        // keep the synced persist).
+        let child = match self
+            .spawn_worker_process(&resident, deadline, TempSync::Unsynced)
+            .await
+        {
             Ok(child) => child,
             Err(error) => {
                 self.registry.remove(&worker_id).await;
@@ -345,7 +375,7 @@ impl Supervisor {
                 &resident,
                 "create",
                 create_payload,
-                LONG_ROUTE_TIMEOUT_MS,
+                WORKER_REQUEST_TIMEOUT_MS,
                 RouteAdmission::SupervisorInternal,
             )
             .await
@@ -617,18 +647,20 @@ impl Supervisor {
     }
 
     /// The worker-driven idle passivation (TS's `idleEvictionMinutes`
-    /// tier, whole-worker): a parent-owned child worker whose park arm
-    /// proved the idle state and crossed the threshold asks for its own
-    /// graceful stop over the supervisor link. The supervisor verifies
-    /// the worker token, re-verifies the parent-owned descriptor (a root
-    /// worker can never ask its way out), and re-reads the setting — the
-    /// supervisor's own fresh-snapshot fence: a setting flipped to
-    /// `"off"` (or past the threshold) between the worker's ask and the
-    /// stop cancels the passivation. The stop itself is the existing
-    /// graceful path (`stop_worker`: durable tombstone, routed shutdown,
-    /// process-retirement wait, registry removal, roster passivation),
-    /// so a passivated child's row stays visible and family-addressable
-    /// and its next prompt wakes a fresh worker over the session file.
+    /// tier, whole-worker): an unowned worker whose park arm proved the
+    /// idle state and crossed the threshold asks for its own graceful
+    /// stop over the supervisor link — TS `canEvictWorker` reaches roots
+    /// and children alike. The supervisor verifies the worker token,
+    /// refuses a client-owned descriptor (TS `hasOwnerClient`), and re-reads
+    /// the setting — the supervisor's own fresh-snapshot fence: a setting
+    /// flipped to `"off"` (or past the threshold) between the worker's
+    /// ask and the stop cancels the passivation. The stop runs under the
+    /// eviction fence (TS `withEvictionFence`) and is the existing
+    /// graceful path (`stop_worker`: durable tombstone, routed
+    /// shutdown, process-retirement wait, registry removal, roster
+    /// passivation), so the passivated worker's row stays visible and
+    /// its next prompt (or an attach by durable id) wakes a fresh worker
+    /// over the session file.
     pub(crate) async fn handle_worker_idle_passivation(
         self: &Arc<Self>,
         command_id: &str,
@@ -644,23 +676,13 @@ impl Supervisor {
                 None,
             );
         };
-        // The parent-owned gate: only a child worker (rlmDepth > 0) may
-        // ask; a root worker's resident lease is client-owned policy.
-        let parent_owned = {
-            let descriptor = resident.descriptor.lock().await;
-            descriptor
-                .create_command
-                .rest
-                .get("rlmDepth")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                > 0
-        };
-        if !parent_owned {
+        // The owner gate (TS `canEvictWorker`'s `hasOwnerClient` arm): a
+        // client-owned worker never passivates itself.
+        if resident.descriptor.lock().await.owner_client_id.is_some() {
             return response_failure(
                 Some(command_id),
                 type_name,
-                "Idle passivation is a child-worker policy; the root worker stays resident",
+                "Idle passivation is refused for a client-owned worker",
                 None,
             );
         }
@@ -683,7 +705,19 @@ impl Supervisor {
                 return response_success(Some(command_id), type_name, None);
             }
         }
-        match self.stop_worker(&resident).await {
+        // TS `withEvictionFence`: holding every in-flight route permit
+        // proves no routed request is still running on this worker (a
+        // drained `cron_add` or prompt would fail TS's fresh
+        // `canEvictWorker`), and refuses new client routes until the
+        // stop has retired the worker. A request in flight defers the
+        // passivation; the worker's next park re-asks.
+        let Ok(fence) = Arc::clone(&resident.inflight).try_acquire_many_owned(
+            u32::try_from(crate::backpressure::WORKER_INFLIGHT_CAPACITY)
+                .expect("in-flight capacity fits u32"),
+        ) else {
+            return response_success(Some(command_id), type_name, None);
+        };
+        match self.stop_worker_releasing(&resident, Some(fence)).await {
             Ok(()) => {
                 self.log_line(&format!(
                     "session worker {} passivated idle (idleEvictionMinutes={threshold})",
@@ -704,6 +738,16 @@ impl Supervisor {
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
     ) -> anyhow::Result<()> {
+        self.stop_worker_releasing(resident, None).await
+    }
+
+    /// The graceful stop; `fence` (the idle passivation's) is released
+    /// past the retire. Every other stop caller passes `None`.
+    async fn stop_worker_releasing(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+        fence: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> anyhow::Result<()> {
         // The stop's durable intent persists BEFORE the worker is told (TS
         // `stopWorkerUntracked(removeDescriptor)` ->
         // `persistWorkerStopTombstone`): a supervisor that dies mid-stop, or
@@ -720,6 +764,12 @@ impl Supervisor {
         // The stop is intentional: routes waiting out a replacement must
         // fail fast instead of parking on this worker.
         resident.note_retired();
+        // The fence releases past the retire (a tombstone-persist failure
+        // fails the stop before it, and the worker stays fully
+        // routable) and before the shutdown route, which needs a permit
+        // of its own. A client route that acquires a freed permit next
+        // sees the retire (the post-admission check in routing.rs).
+        drop(fence);
         match self
             .route_command_typed(
                 resident,
@@ -818,6 +868,13 @@ impl Supervisor {
             }
             _ => {
                 let _ = std::fs::remove_file(&resident.descriptor_path);
+                // The identity-pending side record dies with the
+                // descriptor it shadows (an orphaned pending would
+                // shadow the next identity over the same worker id). A
+                // removal failure here is as inert as the descriptor
+                // removal beside it — the retire already provably killed
+                // the worker, so no later boot applies a shadowed record.
+                let _ = crate::descriptor::clear_identity_pending(&resident.descriptor_path);
             }
         }
     }
@@ -877,6 +934,33 @@ pub(super) fn worker_connect_deadline() -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     now.checked_add(Duration::from_millis(timeout_ms))
         .unwrap_or_else(|| now + Duration::from_millis(DEFAULT_WORKER_CONNECT_TIMEOUT_MS))
+}
+
+impl Supervisor {
+    /// The launch-probe deadline: the supervisor's pinned budget when
+    /// one is set, else the process-wide env seam.
+    pub(super) fn connect_deadline(&self) -> tokio::time::Instant {
+        let budget = *self
+            .worker_connect_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match budget {
+            Some(budget) => tokio::time::Instant::now() + budget,
+            None => worker_connect_deadline(),
+        }
+    }
+
+    /// Test-only: pin this supervisor's launch-probe budget so a launch
+    /// oracle fails its probe immediately without mutating the
+    /// process-wide env var (a set value would leak into every parallel
+    /// test's launch).
+    #[cfg(test)]
+    pub(crate) fn pin_worker_connect_budget_for_tests(&self, budget: Duration) {
+        *self
+            .worker_connect_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(budget);
+    }
 }
 
 /// The real graceful-stop transport (spec §5 `Stopping`): the routed

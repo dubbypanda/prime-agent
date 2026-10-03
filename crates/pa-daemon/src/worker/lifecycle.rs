@@ -136,6 +136,12 @@ impl Worker {
             .as_mut()
             .and_then(|store| store.lease.take());
         drop(lease);
+        // The worker's quit (TS `session_shutdown` reason `quit`): the
+        // pane reporter releases its pane as the last write on the wire
+        // — awaited here so the release lands before this reply unlocks
+        // the process exit, and no late report reclaims the pane.
+        let reporter = self.herdr.lock().unwrap().clone();
+        reporter.release().await;
         response_success(None, "shutdown", None)
     }
 
@@ -231,6 +237,20 @@ impl Worker {
         }
     }
 
+    /// Relist the bound session's ledger children (TS
+    /// `listPassiveRlmSubagents`): awaited where the identity is bound -
+    /// create, and the replacement rebind inside the gate - so the scan is
+    /// ordered with the close walk that follows a later replacement.
+    pub(crate) async fn reseed_rlm_children(&self) {
+        if let Some(children) = self
+            .agent_engine
+            .as_ref()
+            .and_then(|engine| engine.children.clone())
+        {
+            children.reseed_from_ledger().await;
+        }
+    }
+
     /// Wait until the replacement teardown can retire the runtime: no
     /// turn and no compaction in flight. Like the navigation settle, the
     /// park rides a timeout backstop - the turn runner notifies the idle
@@ -308,7 +328,7 @@ impl Worker {
     /// catalog rebind runs separately (`bind_scheduled_jobs`), like the
     /// TS dispatch handlers that call `rebindCronJobsToState` after the
     /// runtime call.
-    pub(crate) fn refresh_replaced_session_state(&self) {
+    pub(crate) async fn refresh_replaced_session_state(&self) {
         let (rlm_depth, summary, child_script) = {
             let mut core = self
                 .core
@@ -334,7 +354,7 @@ impl Worker {
         // child engine file rides along: TS children inherit the
         // replacement runtime's `sessionConfig`, which the runtime keeps
         // across its swaps.
-        if let Err(error) = self
+        match self
             .engine
             .configure_rlm_identity(crate::engine::RlmSessionIdentity {
                 rlm_depth,
@@ -344,9 +364,11 @@ impl Worker {
                 session_file: summary.session_file.clone(),
                 thinking: None,
                 child_script,
-            })
-        {
-            eprintln!("pa-daemon: replacement identity rebind failed: {error:#}");
+                // A TS replacement runtime has no semantic spawn.
+                semantic_spawn: None,
+            }) {
+            Ok(()) => self.reseed_rlm_children().await,
+            Err(error) => eprintln!("pa-daemon: replacement identity rebind failed: {error:#}"),
         }
         if let Ok(summary_value) = serde_json::to_value(&summary) {
             self.engine.set_session_summary(summary_value);
@@ -631,34 +653,89 @@ impl Worker {
         }
     }
 
-    pub(crate) async fn handle_wait_for_idle(&self) -> DaemonResponse {
+    /// The idle park shared by `wait_for_idle` and the headless barrier:
+    /// register the permit before the flag check, or a turn that settles
+    /// between the check and the await loses its wake
+    /// (`notify_waiters` only reaches registered futures).
+    async fn wait_until_idle(&self) {
         loop {
+            let idle = self.idle_notify.notified();
             {
                 let core = self.core.lock().unwrap();
                 if !core.busy && core.steering.is_empty() && core.follow_up.is_empty() {
-                    return response_success(None, "wait_for_idle", None);
+                    return;
                 }
             }
-            self.idle_notify.notified().await;
+            idle.await;
         }
+    }
+
+    /// The idle wait, plus `waitForRlmQuiescence` (TS
+    /// `waitForHeadlessCompletion`'s strong arm over `agent-session.ts`
+    /// `waitForRlmQuiescence`): the barrier also owns descendant work - it
+    /// holds past the session's idle until every tracked child run's
+    /// settle funnel fires (after the terminal notice is delivered), and
+    /// the settle loop re-runs the idle wait, so a settled child's
+    /// terminal notice (a queued turn) drains inside the barrier exactly
+    /// like TS's "work may start at the child-settlement boundary"
+    /// re-check.
+    async fn wait_until_quiescent(&self, payload: &Value) {
+        let children = if payload.get("waitForRlmQuiescence").and_then(Value::as_bool) == Some(true)
+        {
+            self.agent_engine
+                .as_ref()
+                .and_then(|engine| engine.children.clone())
+        } else {
+            None
+        };
+        loop {
+            self.wait_until_idle().await;
+            let Some(children) = children.as_ref() else {
+                return;
+            };
+            // Register the permit before the unsettled-work read: a run
+            // that settles between the read and the await still wakes
+            // this waiter.
+            let settled = children.settle_notified();
+            if !children.any_running().await {
+                // A settle funnel queues its terminal-notice follow-up
+                // BEFORE it marks the run settled, so every notice owed by
+                // the runs settled at this read is already queued: one
+                // more idle wait drains them before the barrier answers.
+                self.wait_until_idle().await;
+                // A notice can start new child work during that drain (a
+                // child-settle hook spawning a descendant): re-read the
+                // runs before answering, so the barrier holds for the
+                // new work too instead of completing at the boundary.
+                if !children.any_running().await {
+                    return;
+                }
+                continue;
+            }
+            settled.await;
+        }
+    }
+
+    /// `wait_for_idle`: park until the session is idle;
+    /// `waitForRlmQuiescence` also holds until its RLM children settled
+    /// (the parent-side settle watcher and `collect` wait out a child's
+    /// whole subtree this way).
+    pub(crate) async fn handle_wait_for_idle(&self, payload: &Value) -> DaemonResponse {
+        self.wait_until_quiescent(payload).await;
+        response_success(None, "wait_for_idle", None)
     }
 
     /// `wait_for_headless_completion` (TS daemon command): settle the
     /// headless run first (same idle wait as `wait_for_idle`), then answer
     /// the autonomous-run accounting snapshot (`DaemonAutonomousStatus`).
-    pub(crate) async fn handle_wait_for_headless_completion(&self) -> DaemonResponse {
+    pub(crate) async fn handle_wait_for_headless_completion(
+        &self,
+        payload: &Value,
+    ) -> DaemonResponse {
         if let Err(response) = self.require_created("wait_for_headless_completion") {
             return response;
         }
-        loop {
-            {
-                let core = self.core.lock().unwrap();
-                if !core.busy && core.steering.is_empty() && core.follow_up.is_empty() {
-                    break;
-                }
-            }
-            self.idle_notify.notified().await;
-        }
+        self.wait_until_quiescent(payload).await;
         // The idle wait finished, so no turn holds the accounting state;
         // the snapshot read cannot interleave with a running turn.
         let status = self

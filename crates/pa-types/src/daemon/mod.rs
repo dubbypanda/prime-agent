@@ -110,6 +110,7 @@ pub struct DaemonEventMeta {
 pub mod agent_roster;
 mod command;
 pub mod framing;
+pub mod herdr_env;
 mod outbound;
 mod plane;
 pub mod update_flow;
@@ -117,14 +118,13 @@ mod worker;
 
 pub use command::{
     CycleDirection, DaemonCommand, DaemonCommandEnvelope, DaemonCommandFrameType,
-    DaemonCommandWire, DaemonExtensionUiResponse, DaemonSessionLifecycle, ForkPosition,
-    PromptInput, StreamingBehavior,
+    DaemonCommandWire, DaemonSessionLifecycle, ForkPosition, PromptInput, StreamingBehavior,
 };
 pub use outbound::{
     DaemonClosingReason, DaemonErrorInfo, DaemonEventEnvelope, DaemonOutbound,
     DaemonPeerTransportTicket, DaemonResponse, DaemonRuntimeIdentity, DaemonSavedSessionInfo,
     DaemonSessionClosedReason, DaemonSessionSnapshot, SnapshotPurpose, SocketIdentity,
-    UPDATE_RESTART_PREPARING_MESSAGE,
+    KERNEL_NOT_RUNNING_MESSAGE, UPDATE_RESTART_PREPARING_MESSAGE,
 };
 pub use plane::{
     command_plane, is_daemon_mutating_command, is_session_plane_daemon_command,

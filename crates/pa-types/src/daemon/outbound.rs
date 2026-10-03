@@ -36,6 +36,14 @@ pub struct DaemonResponse {
 /// clients that wait through the restart (TS #2391).
 pub const UPDATE_RESTART_PREPARING_MESSAGE: &str = "Daemon is preparing an update restart";
 
+/// The session-addressed lanes' refusal when the session's kernel is not
+/// running (the lane never builds one: `factory_activity` answers without
+/// booting an idle kernel). A definitive answer, not a transient failure —
+/// the kernel owns its run registry in memory, so a session without a
+/// kernel carries no live runs; clients read it as such (the TUI's
+/// `/factory off` guard counts zero instead of an unreadable count).
+pub const KERNEL_NOT_RUNNING_MESSAGE: &str = "Kernel is not running";
+
 /// Structured failure info carried on error responses, tagged by `code`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -420,26 +428,6 @@ pub enum DaemonOutbound {
     SessionClosed {
         active_session_id: String,
         reason: DaemonSessionClosedReason,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        meta: Option<DaemonEventMeta>,
-        #[serde(flatten)]
-        rest: JsonMap,
-    },
-    ExtensionUiRequest {
-        active_session_id: String,
-        id: String,
-        method: String,
-        payload: JsonMap,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        meta: Option<DaemonEventMeta>,
-        #[serde(flatten)]
-        rest: JsonMap,
-    },
-    ExtensionError {
-        active_session_id: String,
-        extension_path: String,
-        event: String,
-        error: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         meta: Option<DaemonEventMeta>,
         #[serde(flatten)]

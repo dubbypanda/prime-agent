@@ -94,9 +94,10 @@ pub(crate) struct CreateSessionResources {
     pub(crate) append_system_prompt: Vec<String>,
     pub(crate) skills: Vec<String>,
     pub(crate) prompt_templates: Vec<String>,
-    pub(crate) extensions: Vec<String>,
-    pub(crate) tools: Option<Vec<String>>,
     pub(crate) autonomous: Option<pa_core::autonomous::AgentAutonomousConfig>,
+    /// The creating client's mode (`interactive`, `acp`, ...) for the
+    /// session's telemetry; absent reports `unknown` (TS parity).
+    pub(crate) execution_mode: Option<String>,
 }
 
 /// The create command's `--models` scope inputs (TS main.ts:548-568 +
@@ -140,5 +141,24 @@ impl pa_core::session_engine::rlm_usage::RlmChildUsageSink for ProducerUsageSink
         Box::pin(async move {
             producer.forget_child(&rlm_child_id).await;
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CreateSessionResources;
+    use serde::Deserialize as _;
+
+    /// The create payload's `executionMode` reaches the session telemetry;
+    /// a create without one (an agent-spawned session) stays `None`
+    /// (reported as `unknown`, TS parity).
+    #[test]
+    fn create_resources_read_the_execution_mode() {
+        let payload = serde_json::json!({ "cwd": "/tmp", "executionMode": "interactive" });
+        let resources = CreateSessionResources::deserialize(&payload).unwrap();
+        assert_eq!(resources.execution_mode.as_deref(), Some("interactive"));
+        let resources =
+            CreateSessionResources::deserialize(&serde_json::json!({ "cwd": "/tmp" })).unwrap();
+        assert_eq!(resources.execution_mode, None);
     }
 }

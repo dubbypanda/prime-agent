@@ -147,10 +147,37 @@ fn create_config_carries_the_requested_thinking_level() {
     assert_eq!(config["thinking"], "max");
 }
 
+/// The daemon worker stamps the client's mode on the session's telemetry
+/// (TS `executionMode: appMode`): interactive sessions report
+/// `interactive`, never the worker's own `daemon` context.
+#[test]
+fn create_config_names_the_interactive_execution_mode() {
+    let config = options(ModelSelection::default()).create_config();
+    assert_eq!(config["executionMode"], "interactive");
+}
+
 #[test]
 fn create_config_omits_thinking_when_no_flag_was_given() {
     let config = options(ModelSelection::default()).create_config();
     assert!(config.get("thinking").is_none());
+}
+
+#[test]
+fn create_config_binds_a_new_child_to_its_parent() {
+    let mut opts = options(ModelSelection::default());
+    opts.session = SessionSelection::NewChild {
+        parent_session_file: "/x/p.jsonl".into(),
+        rlm_depth: 2,
+    };
+    assert_eq!(
+        opts.create_config(),
+        json!({
+            "cwd": "/tmp",
+            "executionMode": "interactive",
+            "parentSessionPath": "/x/p.jsonl",
+            "rlmDepth": 2
+        })
+    );
 }
 
 #[test]
@@ -248,6 +275,10 @@ fn the_headless_settle_names_every_stuck_member() {
             mcp_auth_pending: true,
             ..Default::default()
         },
+        HeadlessSettle {
+            anthropic_warning_mark_pending: true,
+            ..Default::default()
+        },
     ] {
         assert!(!stuck.settled(), "one stuck member holds the gate shut");
         assert_eq!(
@@ -280,8 +311,9 @@ fn the_headless_settle_names_every_stuck_member() {
         auth_panel_open: true,
         traces_login_pending: true,
         mcp_auth_pending: true,
+        anthropic_warning_mark_pending: true,
     };
-    assert_eq!(all.blockers().len(), 12);
+    assert_eq!(all.blockers().len(), 13);
     assert!(
         all.blockers()
             .iter()
@@ -293,7 +325,9 @@ fn the_headless_settle_names_every_stuck_member() {
 /// The pre-attach placeholder (painted for a NEW chat before the attach
 /// lands) carries the zero dock the fresh session mounts: the landed
 /// frame keeps the placeholder's geometry, so the splash never reflows
-/// two rows when the session attaches.
+/// two rows when the session attaches. The factory group stays off the
+/// placeholder (the opt-in gate: the group mounts only after the
+/// daemon's hello advertises the `factory_activity` lane).
 #[test]
 fn the_startup_placeholder_carries_the_dock_a_fresh_session_mounts() {
     let mut view = AgentView::new(crate::theme::Theme::builtin(

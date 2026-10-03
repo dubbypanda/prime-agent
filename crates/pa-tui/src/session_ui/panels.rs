@@ -4,13 +4,15 @@
 
 use super::{
     key_event_to_id, mpsc, paused_heartbeat_count, picker_viewport_rows, tray_goal_label,
-    AgentView, BashActivityUpdate, CommandCatalogUpdate, DaemonCommand, DockFocusSource, GoalPanel,
-    HeartbeatsUpdate, InfoContent, InfoPanelAction, KeyEvent, Map, Result, SessionUi, Value,
+    AgentView, BashActivityUpdate, CommandCatalogUpdate, DaemonCommand, DockFocusSource,
+    FactoryUpdate, GoalPanel, HeartbeatsUpdate, InfoContent, InfoPanelAction, KeyEvent, Map,
+    Result, SessionUi, Value,
 };
 
 pub(crate) struct ActivityUpdates {
     pub heartbeats: mpsc::UnboundedSender<HeartbeatsUpdate>,
     pub bash: mpsc::UnboundedSender<BashActivityUpdate>,
+    pub factory: mpsc::UnboundedSender<FactoryUpdate>,
     pub commands: mpsc::UnboundedSender<CommandCatalogUpdate>,
 }
 
@@ -129,6 +131,17 @@ impl SessionUi {
             .iter()
             .filter(|activity| activity.running())
             .count();
+        // The dock's factory indicator counts live runs only — the
+        // view's one liveness rule (`FactoryRunSnapshot::is_live`: a
+        // live state, or children still in flight — a `done` run whose
+        // resident children still run keeps its count like its panel
+        // and its stop control). Fully terminal runs stay as panels
+        // inside the factory page, never in the indicator — the bash
+        // group's running-only scoping, one lane over.
+        let factory_runs = crate::factory_view::parse_factory_runs(&self.factory_graph)
+            .iter()
+            .filter(|run| run.is_live())
+            .count();
         // The dock's subagent count is the live running count only:
         // idle and dead registry rows (passivated children the ledger
         // still seeds) never bloat the indicator — they render in the
@@ -139,6 +152,11 @@ impl SessionUi {
             heartbeats: self.heartbeat_catalog.len(),
             heartbeats_paused: paused_heartbeat_count(&self.heartbeat_catalog),
             bash_running,
+            factory_runs,
+            // The group renders exactly while the daemon advertises the
+            // lane: the factory's opt-in gate (a daemon without the
+            // factory lane never mounts the group).
+            factory_group: self.factory_activity_supported(),
             goal_label,
             selected: self.activity_group,
             focused: self.subagents_focused,
@@ -161,16 +179,13 @@ impl SessionUi {
         }
         match source {
             DockFocusSource::PromptDown => {
-                // TS `SubagentSummaryLine.isSelectable()`: the prompt's
-                // Down is the subagents box's own affordance — subagents
-                // must exist, and the grab selects that group. The dock's
-                // other groups (heartbeats, shells, the goal row) never
-                // take this Down; their shortcut stays
-                // `app.subagents.focus`, so the prompt's arrows keep the
-                // input-history recall in every session shape.
-                if !(self.return_to_agents_view && self.subagent_counts.total > 0) {
-                    return false;
-                }
+                // The prompt's Down always enters the dock, whatever its
+                // counts (the operator's 2026-10-01 consistency ruling: an
+                // all-zero dock, or one with only shells running, must stay
+                // reachable — TS `SubagentSummaryLine.isSelectable()` gated
+                // this on existing subagents, a sanctioned divergence). The
+                // grab lands on the row's first group; Left/Right walk the
+                // rest.
                 self.activity_group = crate::chrome::ActivityGroup::Subagents;
             }
             DockFocusSource::Shortcut => {}
@@ -277,6 +292,10 @@ impl SessionUi {
             crate::chrome::ActivityGroup::Bash => {
                 self.emit_activity_opened("bash");
                 self.open_bash_view(view);
+            }
+            crate::chrome::ActivityGroup::Factory => {
+                self.emit_activity_opened("factory");
+                self.open_factory_page(view);
             }
             crate::chrome::ActivityGroup::Goal => {
                 self.emit_activity_opened("goal");

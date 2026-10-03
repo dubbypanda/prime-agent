@@ -3,13 +3,13 @@
 //! `collect`) over the supervisor's child-sessions registry, with the
 //! spawn-admission helpers only this surface uses.
 use super::{
-    assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
-    resolve_child_model, rlm_child_label, spawn_name_unavailable, Arc, ChildCloseReason,
-    ChildRecord, Context, DaemonCommand, Duration, Instant, Mutex, Path, PathBuf, Result,
-    RlmChildResult, RlmChildTerminalNotice, RlmCreateSessionHandle, RlmCreateSessionRequest,
-    RlmDeleteSubagentResult, RlmHostFuture, RlmSpawnHandle, RlmSpawnRequest, RlmSubagentEntry,
-    RlmSubagentHost, SpawnNameReservationGuard, SupervisorChildSessions,
-    SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
+    assert_thinking_supported, bail, create_default_rlm_subagent_session_name,
+    create_rlm_child_terminal_notice, json, now_ms, resolve_child_model, rlm_child_label,
+    spawn_name_unavailable, Arc, ChildCloseReason, ChildRecord, Context, DaemonCommand, Duration,
+    Instant, Mutex, Path, PathBuf, Result, RlmChildResult, RlmChildTerminalNotice,
+    RlmCreateSessionHandle, RlmCreateSessionRequest, RlmDeleteSubagentResult, RlmHostFuture,
+    RlmSpawnHandle, RlmSpawnRequest, RlmSubagentEntry, RlmSubagentHost, SpawnNameReservationGuard,
+    SupervisorChildSessions, SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
 };
 
 /// Resolve the child model with the daemon `allowedModels` allowlist
@@ -123,6 +123,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         thinking,
                         &cwd,
                         &child_dir,
+                        request.spawned_by_request_id.as_deref(),
                         Some(runtime_metadata),
                         &identity,
                     )
@@ -136,6 +137,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     label: rlm_child_label(&request.prompt),
                     started_at_ms: now_ms(),
                     settled_status: None,
+                    settled: false,
                     answer_preview: None,
                     answer_captured: false,
                     replied_since_task: false,
@@ -144,13 +146,14 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     error: None,
                     closed_by_parent: false,
                     session_file: created.session_file.clone(),
-                    attributed_rows: 0,
+                    attributed_rows: Some(0),
                     usage_watch_live: false,
                     usage_rearm: false,
                     emit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 };
                 let record = Arc::new(Mutex::new(record));
                 this.children.lock().await.push(Arc::clone(&record));
+                this.refresh_running().await;
                 anyhow::Ok((record, created, model))
             }
             .await;
@@ -214,7 +217,13 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         let _ = watcher_this
                             .kill_child(&child_active_session_id, ChildCloseReason::Killed)
                             .await;
-                        watcher_record.lock().await.settled_status = Some("error");
+                        watcher_this
+                            .settle_failed(
+                                &watcher_record,
+                                format!("{retry_error:#}"),
+                                super::lifecycle::FailedArm::Prompt,
+                            )
+                            .await;
                         return;
                     }
                 }
@@ -402,9 +411,17 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     })
                 };
                 if let Some(notice) = notice {
-                    this.deliver_terminal_notice(&notice).await;
+                    this.deliver_terminal_notice(create_rlm_child_terminal_notice(
+                        &notice,
+                        now_ms(),
+                    ))
+                    .await;
                 }
             }
+            // The deletion settles the run (TS `_finishRlmRunDeletion`,
+            // the same resume site the inactive delete funnels through):
+            // a parked barrier re-reads a removed record as settled.
+            this.fire_settle_hook(&record).await;
             Ok(RlmDeleteSubagentResult {
                 subagent: entry,
                 outcome: Some("deleted"),

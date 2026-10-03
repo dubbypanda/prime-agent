@@ -353,6 +353,7 @@ mod tests {
         let engine = Arc::new(
             pa_core::session_engine::engine::create_session(
                 pa_core::session_engine::engine::SessionEngineConfig {
+                    semantic_edges: None,
                     cron_store: None,
                     telemetry: None,
                     cwd: dir.path().to_path_buf(),
@@ -375,8 +376,6 @@ mod tests {
                     rlm_subagent_host: None,
                     rlm_depth: None,
                     model_info: Some(model.clone()),
-                    cli_extension_sources: Vec::new(),
-                    extension_tool_allow_list: None,
                     prewarm_ipython_kernel: None,
                     on_background_work_settled: None,
                     queued_goal_context_purge: None,

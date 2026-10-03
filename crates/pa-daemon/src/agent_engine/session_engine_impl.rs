@@ -26,45 +26,23 @@ impl SessionEngine for AgentSessionEngine {
         }
     }
 
-    /// The engine-side gate mirror of the whole-worker idle
-    /// passivation (TS `canPassivateSession`, session-action-store
-    /// :411-419): `true` only when no non-passive descendants hold work
-    /// and no active-or-paused scheduled job is registered (the shared
-    /// store covers crons AND armed heartbeats — the wake-blind
-    /// substitution). This method only answers the gate; the caller
-    /// owns the residency decision (the kernel release and the
-    /// whole-worker stop each consume it separately).
-    fn can_passivate_settled_session(
+    /// The whole-worker idle passivation gate (the
+    /// `idleEvictionMinutes` consumer): the settled gates plus an
+    /// empty RLM child registry — the registry rule's rationale
+    /// lives on the trait method. The kernel release below does
+    /// NOT carry the registry rule: releasing a kernel keeps the
+    /// worker (and its registry) resident.
+    fn can_passivate_worker(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         Box::pin(async move {
-            // `hasNonPassiveDescendants`: a busy descendant keeps the
-            // child resident (the TS policy).
-            if self.has_unsettled_rlm_work().await {
+            if !self.settled_passivation_gates_pass().await {
                 return false;
             }
-            // `hasRegisteredCronJob`: an active or paused scheduled job
-            // keeps the worker resident — for the whole-worker idle
-            // passivation this gate covers plain cron jobs AND armed
-            // heartbeats alike (the shared scheduled-jobs store holds
-            // both): the port has no relaunch-on-fire for a stopped
-            // worker's jobs, so unlike TS's tier-2 (which evicts
-            // cron-armed workers and lets the fire relaunch) the port
-            // BLOCKS while any job is armed — the wake-blind
-            // substitution, a disclosed deliberate divergence until a
-            // relaunch-on-fire port exists. An unwired probe stays open
-            // (a store-less embedding never passes the gate).
-            let probe = self
-                .registered_jobs_probe
-                .lock()
-                .expect("registered jobs probe lock")
-                .clone();
-            if let Some(probe) = probe {
-                if probe() {
-                    return false;
-                }
+            match self.children.clone() {
+                Some(children) => children.child_identities().await.is_empty(),
+                None => true,
             }
-            true
         })
     }
 
@@ -72,7 +50,7 @@ impl SessionEngine for AgentSessionEngine {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            if !self.can_passivate_settled_session().await {
+            if !self.settled_passivation_gates_pass().await {
                 return;
             }
             // The release itself: best-effort (a failed stop leaves
@@ -506,9 +484,20 @@ impl SessionEngine for AgentSessionEngine {
         if let Some(core) = session.as_deref() {
             let provider = model.provider.clone();
             let model_id = model.id.clone();
-            let _ = self
-                .runtime
-                .block_on(core.session.set_model(&model, &provider, &model_id));
+            // TS `setModel` re-applies the thinking level after the
+            // model swap: the agent slot (the level the request carries)
+            // must equal the level `configure_model` re-clamped above.
+            // ONE agent-lock acquisition updates model and level
+            // together — the loop snapshots both fields under the same
+            // lock, so a turn admitted mid-switch never observes the
+            // new model with the old level. No durable
+            // `thinking_level_change` row: TS `setModel` records only
+            // the model row; `/thinking` owns the intent row.
+            let level = map_thinking_level(self.effective_thinking());
+            let _ = self.runtime.block_on(
+                core.session
+                    .set_model_and_thinking_level(&model, &provider, &model_id, level),
+            );
         }
         // The children registry's inherited parent model follows the
         // switch (the build-time stamp alone would go stale): an inherited
@@ -634,6 +623,12 @@ impl SessionEngine for AgentSessionEngine {
     /// usage reset (TS `session.isQuotaParked`).
     fn is_quota_parked(&self) -> bool {
         AgentSessionEngine::is_quota_parked(self)
+    }
+
+    fn has_running_subagents(&self) -> bool {
+        self.children
+            .as_ref()
+            .is_some_and(|children| children.has_running_children())
     }
 
     /// `compact` over the hosted pa-core session: the session summarizes
@@ -1000,6 +995,46 @@ impl SessionEngine for AgentSessionEngine {
             })
             .unwrap_or((u64::from(DEFAULT_RLM_MAX_DEPTH), "default"));
         *self.rlm_max_depth_source.lock().expect("depth source lock") = source;
+        // The semantic-edge identity (TS `semanticEdgeLedgerPath` +
+        // provenance): a spawned child's ledger lives in its rlm session
+        // dir (the session file's parent), a top-level session's in its
+        // artifact dir; the durable session id is the ledger identity
+        // (the in-memory engine manager's id is per-build). A session
+        // without a durable id records nothing.
+        let semantic_identity = identity.session_id.clone().map(|session_id| {
+            let rlm_session_dir = match &identity.semantic_spawn {
+                Some(_) => identity
+                    .session_file
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .and_then(std::path::Path::parent),
+                None => None,
+            };
+            let artifact_dir = identity
+                .session_file
+                .as_deref()
+                .map(std::path::Path::new)
+                .and_then(pa_core::session_engine::harness_digest::session_artifact_dir_for_log);
+            pa_core::session_engine::semantic_edges::SemanticEdgeIdentity {
+                session_id,
+                ledger_path: pa_core::session_engine::semantic_edges::semantic_edge_ledger_path(
+                    rlm_session_dir,
+                    artifact_dir.as_deref(),
+                ),
+                parent_session_id: identity
+                    .semantic_spawn
+                    .as_ref()
+                    .and_then(|spawn| spawn.parent_session_id.clone()),
+                spawned_by_request_id: identity
+                    .semantic_spawn
+                    .as_ref()
+                    .and_then(|spawn| spawn.spawned_by_request_id.clone()),
+            }
+        });
+        *self
+            .semantic_identity
+            .lock()
+            .expect("semantic identity lock") = semantic_identity;
         if let Some(children) = &self.children {
             let parent = ParentIdentity {
                 rlm_depth: identity.rlm_depth,
@@ -1069,10 +1104,28 @@ impl SessionEngine for AgentSessionEngine {
         let question = request.question.clone();
         let previous_turns = request.previous_turns;
         let retry_policy = pa_core::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY;
+        // TS `unwrapSemanticEdgeStreamFn`: the side call runs on the
+        // session's pre-semantic stream fn, so it carries no request id
+        // and the ledger records nothing. The engine build always wires
+        // it; no fallback to the agent's own fn, which would leak the
+        // id-carrying wrapper into the side call.
+        let side_stream_fn = {
+            let guard = self.session.blocking_lock();
+            guard
+                .as_deref()
+                .and_then(|engine| engine.session.side_question_stream_fn())
+        };
+        let Some(side_stream_fn) = side_stream_fn else {
+            return SideQuestionOutcome::Failed {
+                answer: String::new(),
+                error: "Select a model before asking a side question".to_string(),
+            };
+        };
         let result =
             self.runtime
                 .block_on(pa_core::session_engine::side_question::run_side_question(
                     &agent,
+                    side_stream_fn,
                     &question,
                     &previous_turns,
                     &retry_policy,
@@ -1132,26 +1185,9 @@ impl SessionEngine for AgentSessionEngine {
             let Some(engine) = guard.as_deref() else {
                 return Vec::new();
             };
-            // TS `createAgentConnectionCommands` order: extension
-            // commands, then prompt templates, then skills. The Rust
-            // extension registry does not track per-command source info,
-            // so extension entries carry the TS fields minus
-            // `sourceInfo`.
+            // TS `createAgentConnectionCommands` order: prompt
+            // templates, then skills.
             let mut commands = Vec::new();
-            if let Some(runner) = &engine.extension_runner {
-                let registry = runner.registry().await;
-                for command in registry.commands() {
-                    let mut entry = json!({
-                        "name": command.invocation_name,
-                        "registeredName": command.name,
-                        "source": "extension",
-                    });
-                    if let Some(description) = &command.description {
-                        entry["description"] = json!(description);
-                    }
-                    commands.push(entry);
-                }
-            }
             for template in &engine.prompt_templates {
                 let mut entry = json!({
                     "name": template.name,
@@ -1260,16 +1296,10 @@ impl SessionEngine for AgentSessionEngine {
                 "contextFiles": context_files,
                 "skills": skills,
                 "prompts": prompts,
-                "extensions": [],
                 "themes": [],
                 "diagnostics": {
                     "skills": engine.skill_diagnostics,
                     "prompts": [],
-                    "extensions": engine
-                        .extension_diagnostics
-                        .iter()
-                        .map(|error| json!({ "type": "error", "message": error }))
-                        .collect::<Vec<_>>(),
                     "themes": [],
                 },
             })

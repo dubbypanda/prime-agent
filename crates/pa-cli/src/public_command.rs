@@ -171,6 +171,7 @@ pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
         "schedule" => run_nested_agent_command("schedule", "cron", &rest),
         "status" => run_status(&rest),
         "doctor" => run_doctor(&rest),
+        "telemetry" => run_telemetry(&rest),
         "incident" => run_incident_command(&rest),
         "shutdown" => run_shutdown(&rest),
         "package" => run_package(&rest),
@@ -179,6 +180,7 @@ pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
         "model" => rewrite_nested_command("model", "list", "--list-models", &rest),
         "session" => rewrite_nested_command("session", "export", "--export", &rest),
         "prompt" => handled_with_exit(crate::prompt_command::run_prompt_command(&rest)),
+        "factory" => handled_with_exit(crate::factory_command::run_factory_command(&rest)),
         "config" => {
             if !rest.is_empty() {
                 return fail(format!("Usage: {APP_NAME} config"), None);
@@ -481,6 +483,39 @@ fn run_doctor(args: &[String]) -> PublicCommandResult {
     handled()
 }
 
+/// `prime-agent telemetry [status|on|off]`: the same report and settings
+/// switch as the `/telemetry` slash command, for the current directory's
+/// settings scope.
+fn run_telemetry(args: &[String]) -> PublicCommandResult {
+    let usage = || fail(format!("Usage: {APP_NAME} telemetry [status|on|off]"), None);
+    if args.len() > 1 {
+        return usage();
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let agent_dir = crate::config::get_agent_dir();
+    let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
+    let report = match args.first().map(String::as_str) {
+        None | Some("status") => Ok(pa_core::session_engine::telemetry::telemetry_status_text(
+            &settings, &agent_dir,
+        )),
+        Some(choice @ ("on" | "off")) => {
+            pa_core::session_engine::telemetry::set_telemetry_enabled_text(
+                &mut settings,
+                &agent_dir,
+                choice == "on",
+            )
+        }
+        Some(_) => return usage(),
+    };
+    match report {
+        Ok(report) => {
+            println!("{report}");
+            handled()
+        }
+        Err(error) => fail(format!("{error:#}"), None),
+    }
+}
+
 /// `prime-agent incident` (TS `runIncidentCommand`): parse the options,
 /// resolve the window once, and print the timeline.
 fn run_incident_command(args: &[String]) -> PublicCommandResult {
@@ -617,37 +652,36 @@ fn is_self_update_source(source: &str) -> bool {
     source == "self" || source == "pi" || source == APP_NAME
 }
 
-fn run_update(args: &[String]) -> PublicCommandResult {
-    // The migration path's own surface: the bare command is the
-    // installer takeover (the funnel), and `--check` reports the latest
-    // available build vs the running one without installing. The
-    // TS-parity staged-flow flags below keep their surface exactly as
-    // before (the managed releases/ layout world the battery's wire
-    // suites pin); an installer-based install reports it is not owned by
-    // the installer there, while the bare command works everywhere the
-    // installer does.
-    if args.is_empty() {
-        let options = crate::installer_update::UpdateOptions { check: false };
-        return handled_with_exit(crate::installer_update::run(&options));
+/// A `--check` invocation: `--check` (or `--version`) with at most one
+/// `--nightly` / `--stable`. `None` when the arguments are not a check.
+fn check_invocation(args: &[String]) -> Option<crate::installer_update::UpdateOptions> {
+    use pa_core::update::version::UpdateChannel;
+    let mut check = false;
+    let mut channel = None;
+    for arg in args {
+        match arg.as_str() {
+            "--check" | "--version" => check = true,
+            "--nightly" if channel.is_none() => channel = Some(UpdateChannel::Nightly),
+            "--stable" if channel.is_none() => channel = Some(UpdateChannel::Stable),
+            _ => return None,
+        }
     }
-    // `--check` alone (alias `--version`) reports without installing;
-    // mixed with anything else the staged parse below rejects it.
-    if args
-        .iter()
-        .all(|arg| matches!(arg.as_str(), "--check" | "--version"))
-    {
-        let options = crate::installer_update::UpdateOptions { check: true };
+    check.then_some(crate::installer_update::UpdateOptions {
+        check: true,
+        channel,
+    })
+}
+
+fn run_update(args: &[String]) -> PublicCommandResult {
+    // `--check` (alias `--version`) reports without installing, optionally
+    // for one channel flag; mixed with anything else the parse below
+    // rejects it.
+    if let Some(options) = check_invocation(args) {
         return handled_with_exit(crate::installer_update::run(&options));
     }
     let Some(options) = parse_update_options(args) else {
         return handled_failed();
     };
-    // TS package-manager-cli's update case: the persisted `updateChannel`
-    // setting (`/nightly off`) is the default the update follows
-    // (`options.channel ?? persistedChannel`), an explicit nightly switch
-    // warns and confirms, and a completed run persists the explicit
-    // switch (`commitChannel`) — one shared body with the `package update`
-    // self target (`crate::self_update`).
     let persisted_wire = std::env::current_dir()
         .ok()
         .and_then(|cwd| {
@@ -663,6 +697,17 @@ fn run_update(args: &[String]) -> PublicCommandResult {
         std::io::stdin().is_terminal(),
     ) {
         return handled_with_exit(abort_code);
+    }
+    // The installer funnel serves the bare update and the channel flags:
+    // the channel is the flag, else the saved `updateChannel` setting
+    // (`/nightly on|off`), else the installed one. `--rollback` and
+    // `--archive` stay on the managed-install flow.
+    if !options.rollback && options.archive.is_none() {
+        let update = crate::installer_update::UpdateOptions {
+            check: false,
+            channel: options.channel,
+        };
+        return handled_with_exit(crate::installer_update::run(&update));
     }
     handled_with_exit(crate::self_update::run(&options, persisted_wire.as_deref()))
 }
@@ -925,6 +970,29 @@ mod update_options_tests {
         // The staged flags still parse (the managed-install flow keeps
         // its surface).
         assert!(parse(&["--force"]).is_some());
+    }
+
+    #[test]
+    fn check_combines_with_one_channel_flag() {
+        use pa_core::update::version::UpdateChannel;
+        let channel = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
+            check_invocation(&args).map(|options| options.channel)
+        };
+        assert_eq!(channel(&["--check"]), Some(None));
+        assert_eq!(
+            channel(&["--nightly", "--version"]),
+            Some(Some(UpdateChannel::Nightly))
+        );
+        assert_eq!(
+            channel(&["--check", "--stable"]),
+            Some(Some(UpdateChannel::Stable))
+        );
+        assert_eq!(channel(&[]), None);
+        assert_eq!(channel(&["--nightly"]), None);
+        assert_eq!(channel(&["--check", "--nightly", "--stable"]), None);
+        assert_eq!(channel(&["--check", "--force"]), None);
+        assert_eq!(channel(&["--check", "--rollback"]), None);
     }
 
     #[test]

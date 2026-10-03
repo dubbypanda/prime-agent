@@ -55,6 +55,7 @@ async fn engine_runs_tool_loop_and_persists() {
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
     let engine = create_session(SessionEngineConfig {
+        semantic_edges: None,
         cron_store: None,
         queued_steering_probe: None,
         image_model_router: None,
@@ -81,8 +82,6 @@ async fn engine_runs_tool_loop_and_persists() {
         rlm_depth: None,
         telemetry: None,
         model_info: None,
-        cli_extension_sources: vec![],
-        extension_tool_allow_list: None,
         on_background_work_settled: None,
         prewarm_ipython_kernel: None,
         queued_goal_context_purge: None,
@@ -156,6 +155,7 @@ async fn spawned_child_prompt_stamps_its_depth() {
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
     let engine = create_session(SessionEngineConfig {
+        semantic_edges: None,
         cron_store: None,
         queued_steering_probe: None,
         image_model_router: None,
@@ -182,8 +182,6 @@ async fn spawned_child_prompt_stamps_its_depth() {
         rlm_depth: Some(2),
         telemetry: None,
         model_info: None,
-        cli_extension_sources: vec![],
-        extension_tool_allow_list: None,
         on_background_work_settled: None,
         prewarm_ipython_kernel: None,
         queued_goal_context_purge: None,
@@ -224,6 +222,7 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
         stream_fn: pa_agent::stream::StreamFn,
     ) -> SessionEngineConfig {
         SessionEngineConfig {
+            semantic_edges: None,
             cron_store: None,
             queued_steering_probe: None,
             image_model_router: None,
@@ -250,8 +249,6 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
             rlm_depth: None,
             telemetry: None,
             model_info: None,
-            cli_extension_sources: vec![],
-            extension_tool_allow_list: None,
             on_background_work_settled: None,
             prewarm_ipython_kernel: None,
             queued_goal_context_purge: None,

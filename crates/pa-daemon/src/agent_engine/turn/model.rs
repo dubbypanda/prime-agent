@@ -95,6 +95,22 @@ impl AgentSessionEngine {
                 }
             }
         };
+        // The delivery's cancel flag is consulted at the admission, before
+        // the agent run registers: an abort that landed after this
+        // delivery's pickup but before the registration (the lazy session
+        // build and the policy reads widened TS's microscopic
+        // registration gap to the whole admission prefix) is otherwise
+        // lost — `abort_in_flight_turn`'s `agent.abort()` found an empty
+        // run slot, the run registers fresh after it, and the turn runs
+        // its full provider hold (the abort-and-send idle race: the
+        // session never went idle after the abort). The probe is
+        // delivery-scoped by construction (the pickup clears the flag,
+        // the next pickup re-arms it), so this consult aborts exactly the
+        // turn the abort raced. The remaining window (the run's own
+        // registration) is TS's own gap scale.
+        if aborted() {
+            return TurnResult::Aborted;
+        }
         // A routed image-model episode applies its override BEFORE the
         // first provider call: the serving target swaps to the image
         // model and the run carries the route's model override (the
@@ -132,9 +148,18 @@ impl AgentSessionEngine {
         };
         // Retry/failover adoption telemetry (TS `auto_retry_start` counting):
         // retries increment `retry_count`, provider switches `failover_count`.
-        let telemetry = {
+        // The semantic-edge recorder rides the same snapshot (TS
+        // `prepareTurnRetry` / `clearTurnRetry` ride the retry events: the
+        // parked id makes the retried call reuse the failed attempt's
+        // idempotency key).
+        let (telemetry, semantic_edges) = {
             let guard = self.session.blocking_lock();
-            guard.as_deref().and_then(|engine| engine.telemetry.clone())
+            (
+                guard.as_deref().and_then(|engine| engine.telemetry.clone()),
+                guard
+                    .as_deref()
+                    .and_then(|engine| engine.session.semantic_edges()),
+            )
         };
         // The failover-captured primary target state (TS `_backupModel`):
         // the model, its thinking level, and its resolved request auth,
@@ -196,7 +221,14 @@ impl AgentSessionEngine {
                             drop_trailing_assistant(&agent).await;
                         }
                         match self
-                            .run_turn_once(&agent, &prompt, first, boundary_passed, &mut **emit)
+                            .run_turn_once(
+                                &agent,
+                                &prompt,
+                                first,
+                                boundary_passed,
+                                aborted,
+                                &mut **emit,
+                            )
                             .await
                         {
                             Ok(TurnOnce::Message { assistant }) => {
@@ -217,7 +249,25 @@ impl AgentSessionEngine {
                 |event| {
                     let mut emit = emit_cell.borrow_mut();
                     let telemetry = telemetry.clone();
+                    let semantic_edges = semantic_edges.clone();
                     async move {
+                        // TS parks the id at `auto_retry_start` and clears
+                        // it at the settle (`_resolveRetry`), so a
+                        // body-identical retry reuses the failed
+                        // attempt's id; the parked id lives until the
+                        // next turn mints over it otherwise.
+                        if let Some(recorder) = &semantic_edges {
+                            match &event {
+                                pa_core::session_engine::auto_retry::AutoRetryEvent::Start {
+                                    ..
+                                } => recorder.prepare_turn_retry(),
+                                pa_core::session_engine::auto_retry::AutoRetryEvent::End {
+                                    ..
+                                } => {
+                                    recorder.clear_turn_retry();
+                                }
+                            }
+                        }
                         if let Some(telemetry) = &telemetry {
                             // One retry event in, one telemetry seam out: the
                             // Start counts the retry (plus a backup-provider

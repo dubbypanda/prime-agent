@@ -65,6 +65,9 @@ pub struct ExecuteResult {
     /// Agent messages sent from this cell, in order (TS
     /// `sentAgentMessages` on the tool-result details).
     pub sent_agent_messages: Vec<crate::kernel::shared::KernelSentAgentMessage>,
+    /// The `bash()` commands this cell started, summarized for display
+    /// (`bashCommands` on the tool-result details).
+    pub bash_commands: Option<crate::kernel::shared::KernelBashCommands>,
 }
 
 /// The wire form of one sent agent message (TS `KernelSentAgentMessage`):
@@ -220,8 +223,8 @@ pub fn kernel_restart_notice() -> &'static str {
     "<ipython_kernel_reset>\nThe Python kernel was restarted after a previous interrupted cell kept running. Variables, imports, async tasks, and open resources from before the restart are no longer available; recreate them before using them.\n</ipython_kernel_reset>"
 }
 
-/// The UI surface the ipython tool needs from the host session
-/// (the `ExtensionContext` in TS).
+/// The UI surface the ipython tool needs from the host session (the TS
+/// tool context).
 pub trait IpythonToolUi: Send + Sync {
     /// Prompt the user to choose between `choices`.
     fn select(
@@ -457,6 +460,13 @@ pub async fn execute_ipython(
     }
     if let Some(result_text) = &r.result {
         details["result"] = json!(result_text);
+    }
+    if let Some(bash) = &r.bash_commands {
+        details["bashCommands"] = json!({
+            "first": bash.first,
+            "count": bash.count,
+            "lines": bash.lines,
+        });
     }
     if let Some(background) = &r.background_output {
         details["backgroundOutput"] = json!(background);

@@ -24,10 +24,11 @@ use pa_core::session_engine::rlm_host::{
     RlmSubagentHost,
 };
 use pa_core::session_engine::rlm_notices::{
-    create_rlm_child_terminal_notice, RlmChildTerminalNotice,
+    create_rlm_child_failure_message, create_rlm_child_terminal_notice, RlmChildTerminalNotice,
 };
 use pa_core::session_engine::rlm_usage::{RlmChildUsageReport, RlmChildUsageSink};
 use pa_types::daemon::{DaemonCommand, DaemonSessionLifecycle, PromptInput};
+use pa_types::session::CustomMessage;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -150,6 +151,14 @@ pub struct RlmChildIdentity {
     pub session_name: String,
 }
 
+/// The selector that reaches a child whether or not its worker is
+/// resident: the persisted session id (the session-file stem the
+/// supervisor's ledger wake resolves), else the RLM child id. The
+/// spawn-time live id stops resolving once the worker passivates.
+pub(crate) fn durable_child_selector(session_id: Option<&str>, rlm_child_id: &str) -> String {
+    session_id.unwrap_or(rlm_child_id).to_string()
+}
+
 /// One tracked child session.
 #[derive(Debug)]
 struct ChildRecord {
@@ -163,6 +172,11 @@ struct ChildRecord {
     /// Terminal state (`done` | `error` | `cancelled`); running while
     /// absent.
     settled_status: Option<&'static str>,
+    /// TS `run.settled`: set only by the settle funnel, after the
+    /// terminal notice is delivered - the terminal status above flips
+    /// earlier (TS's `run.status`/`run.settled` pair), so the quiescence
+    /// predicate waits out the notice window.
+    settled: bool,
     answer_preview: Option<String>,
     answer_captured: bool,
     /// An agent message from this child reached the parent since its task
@@ -191,8 +205,10 @@ struct ChildRecord {
     session_file: Option<String>,
     /// Rows of [`ChildRecord::session_file`] already folded into the
     /// parent's attribution rows. The walk resumes here, so repeated
-    /// observation never double-bills a child.
-    attributed_rows: usize,
+    /// observation never double-bills a child. `None` on a reseeded row:
+    /// nothing has been observed since the reseed, and the first delivery
+    /// primes the cursor at the file's tail.
+    attributed_rows: Option<usize>,
     /// A follow-up usage watcher is live for this retained child
     /// (delayed agent messaging after the task run settled).
     usage_watch_live: bool,
@@ -229,6 +245,16 @@ impl ChildRecord {
             || self.session_name == target
             || self.session_id.as_deref() == Some(target)
     }
+}
+
+/// Whether any record's settle funnel has not fired yet.
+async fn any_unsettled(children: &[Arc<Mutex<ChildRecord>>]) -> bool {
+    for record in children {
+        if !record.lock().await.settled {
+            return true;
+        }
+    }
+    false
 }
 
 /// A deleted child's retained identity (TS `_deletedRlmChildRuns`
@@ -328,6 +354,17 @@ struct SupervisorChildSessionsInner {
     /// The parent engine's child-settle hook (goal continuation resume);
     /// `None` until the engine wires it.
     settle_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Whether any tracked child run is unsettled (the `any_running`
+    /// verdict, re-read at every registry change): a sync read for the
+    /// worker's session summary, and a change feed the worker turns into
+    /// roster pushes.
+    running: tokio::sync::watch::Sender<bool>,
+    /// The quiescence barrier's wake (TS `waitForRlmQuiescence`,
+    /// agent-session.ts): `notify_waiters` fires once per settled child
+    /// run - every settle site funnels through the settle hook below -
+    /// and once per close walk, so a barrier parked behind descendant
+    /// work re-reads the registry when the descendants settle.
+    settle_notify: tokio::sync::Notify,
     /// The worker's model-allowlist refusal telemetry (`model refused`):
     /// `spawn/create_session` refusals emit through the engine's shared
     /// lazily-built client.
@@ -342,6 +379,13 @@ struct SupervisorChildSessionsInner {
     /// `/context` children immediately, not ride out the next background
     /// refresh.
     delete_notifier: std::sync::Mutex<Option<DeleteNotifier>>,
+    /// The parent session's semantic-edge recorder (wired once the session
+    /// engine is built; the settle watcher records a returned child's last
+    /// committed request into it). `None` until the build or for sessions
+    /// without a semantic identity.
+    semantic_edges: std::sync::Mutex<
+        Option<std::sync::Arc<pa_core::session_engine::semantic_edges::SemanticEdgeRecorder>>,
+    >,
 }
 
 impl Clone for SupervisorChildSessions {
@@ -371,9 +415,12 @@ impl SupervisorChildSessions {
                 deleted_children: std::sync::Mutex::new(std::collections::HashMap::new()),
                 turn_done: tokio::sync::watch::Sender::new(0),
                 settle_hook: std::sync::Mutex::new(None),
+                running: tokio::sync::watch::Sender::new(false),
+                settle_notify: tokio::sync::Notify::new(),
                 model_refusal_telemetry,
                 usage_sink: std::sync::Mutex::new(None),
                 delete_notifier: std::sync::Mutex::new(None),
+                semantic_edges: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -428,6 +475,26 @@ impl SupervisorChildSessions {
         *self.inner.usage_sink.lock().expect("usage sink lock") = Some(sink);
     }
 
+    /// Wire the parent session's semantic-edge recorder (the per-build
+    /// handoff beside the usage sink): the settle watcher records a
+    /// returned child's last committed request into it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the semantic-edges mutex is poisoned.
+    pub fn set_semantic_edges(
+        &self,
+        recorder: Option<
+            std::sync::Arc<pa_core::session_engine::semantic_edges::SemanticEdgeRecorder>,
+        >,
+    ) {
+        *self
+            .inner
+            .semantic_edges
+            .lock()
+            .expect("semantic edges lock") = recorder;
+    }
+
     /// Whether a spawn-name reservation currently holds `name` (the TS
     /// test peeks `_pendingRlmSubagentSessionNames`; the reservation must
     /// span the whole admission and release at its settle).
@@ -440,17 +507,32 @@ impl SupervisorChildSessions {
             .contains(name)
     }
 
+    /// The barrier's wake permit (the `settle_notify` field owns the
+    /// semantics).
+    pub(crate) fn settle_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.settle_notify.notified()
+    }
+
     /// Whether any tracked child run is still unsettled (TS
-    /// `_hasUnsettledRlmQuiescenceWork`'s child-run arm: a record without
-    /// a terminal state).
+    /// `_hasUnsettledRlmQuiescenceWork`'s child-run arm: a run whose
+    /// settle funnel has not fired - the terminal status flips before
+    /// the terminal notice is delivered, `run.settled` after).
     pub async fn any_running(&self) -> bool {
-        let children = self.inner.children.lock().await;
-        for record in children.iter() {
-            if record.lock().await.settled_status.is_none() {
-                return true;
-            }
-        }
-        false
+        self.inner.any_running().await
+    }
+
+    /// The last [`Self::any_running`] verdict, without awaiting the
+    /// registry: the session summary counts this session as working
+    /// while any of its children still runs.
+    #[must_use]
+    pub fn has_running_children(&self) -> bool {
+        *self.inner.running.borrow()
+    }
+
+    /// A feed that changes whenever [`Self::has_running_children`] flips.
+    #[must_use]
+    pub fn subscribe_running(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.inner.running.subscribe()
     }
 
     /// Close every tracked child session with the parent session (TS
@@ -483,6 +565,12 @@ impl SupervisorChildSessions {
     /// while holding the lock).
     pub fn set_identity(&self, identity: ParentIdentity) {
         *self.inner.identity.lock().expect("identity lock") = identity;
+    }
+
+    /// Rebuild the children registry from the spawn ledger (a restarted
+    /// parent lists its ledger children again).
+    pub async fn reseed_from_ledger(&self) {
+        self.inner.reseed_from_ledger().await;
     }
 
     /// The inherited RLM depth bound (TS `getRlmMaxDepthStatus().maxDepth`
@@ -607,6 +695,22 @@ impl SupervisorChildSessions {
         }
     }
 
+    /// Test seam: settle a pushed child record (the passivation-gate
+    /// tests exercise a registry that holds only settled children).
+    #[cfg(test)]
+    pub(crate) async fn settle_test_child(&self, child_active_session_id: &str) {
+        let children = self.inner.children.lock().await;
+        for record in children.iter() {
+            let mut record = record.lock().await;
+            if record.active_session_id == child_active_session_id {
+                record.settled_status = Some("done");
+                // The settle funnel's flag (`fire_settle_hook`): the
+                // quiescence predicate reads it, not the terminal status.
+                record.settled = true;
+            }
+        }
+    }
+
     /// Test seam: admit one child record without the supervisor round trip
     /// (the controller tests exercise the family join on registry state).
     #[cfg(test)]
@@ -624,6 +728,7 @@ impl SupervisorChildSessions {
                 label: String::new(),
                 started_at_ms: 0,
                 settled_status: None,
+                settled: false,
                 answer_preview: None,
                 answer_captured: false,
                 replied_since_task: false,
@@ -632,7 +737,7 @@ impl SupervisorChildSessions {
                 error: None,
                 closed_by_parent: false,
                 session_file: None,
-                attributed_rows: 0,
+                attributed_rows: Some(0),
                 usage_watch_live: false,
                 usage_rearm: false,
                 emit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -754,8 +859,14 @@ impl SupervisorChildSessions {
 
 impl SupervisorChildSessionsInner {
     /// Fire the settle hook off-thread (the settle sites run inside
-    /// watcher tasks; the hook owns its own scheduling).
-    pub(crate) fn fire_settle_hook(&self) {
+    /// watcher tasks; the hook owns its own scheduling). The funnel is
+    /// the one definition of a settled run (TS's run task `finally`): it
+    /// marks the record settled and wakes the quiescence barrier, only
+    /// after the terminal notice is delivered.
+    pub(crate) async fn fire_settle_hook(&self, record: &Arc<Mutex<ChildRecord>>) {
+        record.lock().await.settled = true;
+        self.refresh_running().await;
+        self.settle_notify.notify_waiters();
         let hook = self
             .settle_hook
             .lock()
@@ -765,6 +876,28 @@ impl SupervisorChildSessionsInner {
             std::thread::spawn(move || hook());
         }
     }
+
+    /// Whether any tracked child run's settle funnel has not fired yet.
+    pub(crate) async fn any_running(&self) -> bool {
+        let children = self.children.lock().await;
+        any_unsettled(&children).await
+    }
+
+    /// Re-read [`Self::any_running`] into the `running` feed after a
+    /// registry change (a registration, a settle, a close walk). The read
+    /// and the publish share one hold of the children lock, so racing
+    /// refreshes publish in order and the last one always reflects the
+    /// registry after every change that preceded it.
+    pub(crate) async fn refresh_running(&self) {
+        let children = self.children.lock().await;
+        let running = any_unsettled(&children).await;
+        self.running.send_if_modified(|current| {
+            let changed = *current != running;
+            *current = running;
+            changed
+        });
+    }
+
     /// Wait for the parent turn that spawned a task to complete (generation
     /// strictly greater than the one captured at spawn admission). Bounded:
     /// a turn that never settles releases the child anyway.

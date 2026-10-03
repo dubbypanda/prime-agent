@@ -89,8 +89,10 @@ impl Worker {
                 response_success(None, "abort_compaction", None)
             }
             "set_auto_compaction" => self.handle_set_auto_compaction(payload),
-            "wait_for_idle" => self.handle_wait_for_idle().await,
-            "wait_for_headless_completion" => self.handle_wait_for_headless_completion().await,
+            "wait_for_idle" => self.handle_wait_for_idle(payload).await,
+            "wait_for_headless_completion" => {
+                self.handle_wait_for_headless_completion(payload).await
+            }
             "get_state" => self.handle_get_state(),
             "get_messages" => self.handle_get_messages(),
             "get_session_header" => self.handle_get_session_header(),
@@ -119,6 +121,7 @@ impl Worker {
             "shutdown" => self.handle_shutdown().await,
             "rename" => self.handle_rename("rename", payload),
             "set_session_name" => self.handle_rename("set_session_name", payload),
+            "mark_anthropic_warning_shown" => self.handle_mark_anthropic_warning_shown(),
             "rename_saved_session" => self.handle_rename_saved_session(payload),
             "delete_saved_session" => self.handle_delete_saved_session(payload).await,
             "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
@@ -146,6 +149,7 @@ impl Worker {
             "export_jsonl" => self.exports.export_jsonl(payload),
             "mutate_queued_message" => self.handle_mutate_queued_message(payload),
             "resume_queue" => self.handle_resume_queue(),
+            "factory_activity" => self.handle_factory_activity(payload).await,
             "execute_bash" => self.handle_execute_bash(payload),
             "execute_bash_and_wait" => self.handle_execute_bash_and_wait(payload).await,
             "abort_bash" => self.handle_abort_bash().await,
@@ -158,7 +162,6 @@ impl Worker {
             "restore_actions" => self.handle_restore_actions(payload),
             "refine" => self.handle_refine(payload).await,
             "reload" => self.handle_reload(),
-            "extension_ui_response" => self.handle_extension_ui_response(payload),
             "cancel_rlm_child" => self.handle_cancel_rlm_child(payload).await,
             "delete_rlm_subagent" => self.handle_delete_rlm_subagent(payload).await,
             // The engine call blocks on the engine runtime (the durable
@@ -421,7 +424,8 @@ impl Worker {
                         kept.push_back(item);
                     } else {
                         if let Some(id) = &item.admission_id {
-                            let _ = self.prompt_admissions.cancel(id);
+                            // A withdrawn prompt clears its admission (TS clearAdmission).
+                            self.prompt_admissions.clear(id);
                         }
                         if let Some(done) = item.done {
                             let _ = done.send(TurnSettle::Withdrawn(
@@ -563,8 +567,18 @@ impl Worker {
             return response;
         }
         let mut core = self.core.lock().unwrap();
-        let steering: Vec<String> = core.steering.drain(..).map(|item| item.message).collect();
-        let follow_up: Vec<String> = core.follow_up.drain(..).map(|item| item.message).collect();
+        let drain_lane = |lane: &mut VecDeque<QueuedItem>| -> Vec<String> {
+            lane.drain(..)
+                .map(|item| {
+                    if let Some(id) = item.admission_id.as_deref() {
+                        self.prompt_admissions.clear(id);
+                    }
+                    item.message
+                })
+                .collect()
+        };
+        let steering: Vec<String> = drain_lane(&mut core.steering);
+        let follow_up: Vec<String> = drain_lane(&mut core.follow_up);
         let snapshot = Self::snapshot_locked(&core);
         drop(core);
         // The cleared lanes are idle again: the verdict refresh rides the
@@ -743,7 +757,40 @@ impl Worker {
             .as_mut()
             .and_then(|store| store.lease.take());
         drop(lease);
+        // The session runtime ended (TS `prime-agent stop <agent>`): the
+        // pane reporter releases its pane as the last write on the wire —
+        // no report may reclaim it afterwards. The slot is taken out
+        // first (swapped to the disabled no-op) so a later attach can
+        // adopt the pane again; the taken handle's release is the
+        // release of the session this kill stopped.
+        let reporter = std::mem::take(&mut *self.herdr.lock().unwrap());
+        reporter.release().await;
         response_success(None, "kill", None)
+    }
+
+    /// `mark_anthropic_warning_shown` (Rust-native, operator directive
+    /// 2026-09-29): the interactive client reports that it just drew the
+    /// Anthropic subscription ban-risk warning; the worker persists the
+    /// once-per-session-lifecycle marker row (the gate a reattach, a resume,
+    /// or a worker replacement reads). Idempotent — a session already marked
+    /// (or an in-memory session with no file) answers success without a
+    /// second row.
+    fn handle_mark_anthropic_warning_shown(&self) -> DaemonResponse {
+        const NAME: &str = "mark_anthropic_warning_shown";
+        if let Err(response) = self.require_created(NAME) {
+            return response;
+        }
+        let mut core = self.core.lock().unwrap();
+        let Some(store) = core.store.as_mut() else {
+            return response_failure(None, NAME, "Session is still initializing", None);
+        };
+        if store.anthropic_warning_shown() {
+            return response_success(None, NAME, None);
+        }
+        match store.mark_anthropic_warning_shown() {
+            Ok(()) => response_success(None, NAME, None),
+            Err(error) => response_failure(None, NAME, &error.to_string(), None),
+        }
     }
 
     pub(crate) fn handle_rename(&self, command: &str, payload: &Value) -> DaemonResponse {
